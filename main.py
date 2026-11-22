@@ -130,6 +130,28 @@ def find_pads():
 
 
 # ---------- Diagnostic ----------
+PS_PNP = r"""
+$ErrorActionPreference='SilentlyContinue'
+Get-PnpDevice -PresentOnly | Where-Object {
+  $_.FriendlyName -match 'controller|gamepad|lumora|cosmic|xbox|joystick|game|wireless|2\.4|receiver|dongle' -and
+  $_.FriendlyName -notmatch 'host controller|usb root|enumerator'
+} | ForEach-Object { "$($_.Class) | $($_.FriendlyName) | $($_.InstanceId)" }
+Get-PnpDevice -Class Bluetooth -PresentOnly | ForEach-Object { "BT | $($_.FriendlyName) | $($_.InstanceId)" }
+"""
+
+
+def pnp_list():
+    if os.name != "nt":
+        return "(not Windows)"
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", PS_PNP],
+                           capture_output=True, text=True, timeout=25,
+                           creationflags=CREATE_NO_WINDOW)
+        return r.stdout.strip() or "(nothing found)"
+    except Exception as e:
+        return f"(error: {e})"
+
+
 def diagnostic():
     path = os.path.join(OUT_DIR, "diagnostic.txt")
     L = ["", f"===== {datetime.now():%Y-%m-%d %H:%M:%S} =====",
@@ -140,6 +162,8 @@ def diagnostic():
             r = xinput.XInputGetBatteryInformation(s, 0, ctypes.byref(info))
             L.append(f"XInput slot {s}: ret={r} type={info.BatteryType} level={info.BatteryLevel}")
     L.append("Bluetooth battery (name, %): " + repr(bt_batteries()))
+    L.append("--- Windows devices (PnP) ---")
+    L.append(pnp_list())
     if hid:
         try:
             devs = [d for d in hid.enumerate() if is_pad(d)]
