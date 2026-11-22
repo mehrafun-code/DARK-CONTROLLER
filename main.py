@@ -91,6 +91,76 @@ def match_bt(batts, pad_name):
     return None
 
 
+# ---------- Switch Pro Controller protocol (Lumora in Bluetooth "Pro Controller" mode) ----------
+PRO_VID, PRO_PID = 0x057E, 0x2009
+PRO_LEVELS = {8: 100, 6: 75, 4: 50, 2: 25, 0: 5}  # 4 steps (+ charging bit)
+
+
+def pro_handshake_packet(counter=0):
+    """Output report 0x01, subcommand 0x03 = set input report mode 0x30 (full)."""
+    pkt = bytearray(49)
+    pkt[0] = 0x01
+    pkt[1] = counter & 0x0F
+    pkt[2:10] = bytes([0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40])
+    pkt[10] = 0x03
+    pkt[11] = 0x30
+    return bytes(pkt)
+
+
+def parse_pro_report(d):
+    """Return (pct, charging) from a 0x30/0x21/0x31 report, else None."""
+    if len(d) > 2 and d[0] in (0x30, 0x21, 0x31):
+        v = d[2] >> 4
+        return PRO_LEVELS.get(v & 0x0E, 0), bool(v & 1)
+    return None
+
+
+class ProReader:
+    def __init__(self):
+        self.h, self.path, self.cnt, self.miss = None, None, 0, 0
+
+    def open(self, path):
+        self.close()
+        h = hid.device()
+        h.open_path(path)
+        h.set_nonblocking(True)
+        self.h, self.path, self.miss = h, path, 0
+        self.cnt += 1
+        h.write(pro_handshake_packet(self.cnt))
+
+    def read(self):
+        if self.h is None:
+            return None
+        res = None
+        for _ in range(300):  # drain buffer, keep newest battery info
+            d = self.h.read(64)
+            if not d:
+                break
+            r = parse_pro_report(d)
+            if r:
+                res = r
+        if res is None:
+            self.miss += 1
+            if self.miss >= 3:  # re-send handshake if controller is silent
+                self.miss = 0
+                self.cnt += 1
+                try:
+                    self.h.write(pro_handshake_packet(self.cnt))
+                except Exception:
+                    self.close()
+        else:
+            self.miss = 0
+        return res
+
+    def close(self):
+        try:
+            if self.h:
+                self.h.close()
+        except Exception:
+            pass
+        self.h, self.path = None, None
+
+
 # ---------- HID link detection ----------
 def path_str(d):
     p = d.get("path", b"")
@@ -99,6 +169,11 @@ def path_str(d):
 
 def is_pad(d):
     return (d.get("usage_page") == 1 and d.get("usage") in (4, 5)) or "&ig_" in path_str(d)
+
+
+# Lumora shows a different USB PID in each mode (seen: 045E:A2B2 and 045E:A2B3).
+# Fill in once we know which is which, e.g. {(0x045E, 0xA2B3): "USB WIRED"}
+PID_LINK = {}
 
 
 def classify_link(p, name):
@@ -125,7 +200,9 @@ def find_pads():
         name = d.get("product_string") or "Controller"
         key = (d.get("vendor_id"), d.get("product_id"))
         if key not in pads:
-            pads[key] = {"name": name, "link": classify_link(p, name)}
+            link = PID_LINK.get(key) or classify_link(p, name)
+            pads[key] = {"name": name, "link": link, "vid": key[0], "pid": key[1],
+                         "path": d.get("path")}
     return list(pads.values())
 
 
@@ -184,17 +261,24 @@ def diagnostic():
                 h = hid.device()
                 h.open_path(d["path"])
                 h.set_nonblocking(True)
-                seen, t0 = [], time.time()
-                while time.time() - t0 < 3 and len(seen) < 6:
+                is_pro = d.get("vendor_id") == PRO_VID and d.get("product_id") == PRO_PID
+                if is_pro:
+                    h.write(pro_handshake_packet(1))
+                seen, t0, parsed = [], time.time(), None
+                while time.time() - t0 < 3:
                     data = h.read(64)
                     if data:
-                        hx = bytes(data).hex(" ")
-                        if hx not in seen:
+                        r = parse_pro_report(data) if is_pro else None
+                        parsed = r or parsed
+                        hx = bytes(data[:20]).hex(" ")
+                        if hx not in seen and len(seen) < 6:
                             seen.append(hx)
-                    time.sleep(0.02)
+                    time.sleep(0.005)
                 h.close()
-                L.append(f"{d.get('product_string')} ({len(seen)} reports):")
+                L.append(f"{d.get('product_string')} ({len(seen)} distinct reports):")
                 L.extend("   " + s for s in seen)
+                if is_pro:
+                    L.append(f"   Switch-protocol battery/charging parsed: {parsed}")
             except Exception as e:
                 L.append(f"{d.get('product_string')}: cannot open ({e})")
     with open(path, "a", encoding="utf-8") as f:
@@ -254,7 +338,7 @@ class App(tk.Tk):
             pass
 
         self.state = {"online": False, "link": None, "name": "--", "pct": None,
-                      "source": "--", "charging": False}
+                      "source": "--", "charging": False, "approx": False}
         self.shown = 0.0
         self.msg, self.msg_until = "", 0
         self.diag_running = False
@@ -271,6 +355,7 @@ class App(tk.Tk):
     # ----- background detection -----
     def worker(self):
         batts, last_bt = [], 0.0
+        pro = ProReader()
         order = {"USB WIRED": 0, "2.4GHZ DONGLE": 1, "BLUETOOTH": 2}
         while True:
             try:
@@ -279,15 +364,35 @@ class App(tk.Tk):
                         if p["link"] == "BLUETOOTH" or xinput is None or xi is not None]
                 pads.sort(key=lambda p: order[p["link"]])
                 st = {"online": False, "link": None, "name": "--", "pct": None,
-                      "source": "--", "charging": False}
+                      "source": "--", "charging": False, "approx": False}
                 if pads:
                     st.update(online=True, link=pads[0]["link"], name=pads[0]["name"])
                 elif xi is not None:
                     st.update(online=True, link="XINPUT", name="XInput Controller")
 
+                pad = pads[0] if pads else None
+                is_pro = bool(pad and pad["vid"] == PRO_VID and pad["pid"] == PRO_PID
+                              and pad["link"] == "BLUETOOTH")
+                if not is_pro:
+                    pro.close()
+                st["approx"] = False
+
                 if st["online"]:
                     st["charging"] = st["link"] == "USB WIRED"
-                    if st["link"] == "BLUETOOTH":
+                    if is_pro:
+                        try:
+                            if pro.path != pad["path"]:
+                                pro.open(pad["path"])
+                            r = pro.read()
+                        except Exception:
+                            pro.close()
+                            r = None
+                        if r:
+                            st.update(pct=r[0], charging=r[1], source="SWITCH PROTOCOL",
+                                      approx=True)
+                        else:
+                            st["source"] = "NOT REPORTED"
+                    elif st["link"] == "BLUETOOTH":
                         if time.time() - last_bt > 15:
                             batts, last_bt = bt_batteries(), time.time()
                         v = match_bt(batts, st["name"])
@@ -296,7 +401,8 @@ class App(tk.Tk):
                         else:
                             st["source"] = "NOT REPORTED"
                     elif xi and xi["type"] in (2, 3):  # real wireless battery
-                        st.update(pct=LEVEL_PERCENT.get(xi["level"], 0), source="XINPUT (4 LEVELS)")
+                        st.update(pct=LEVEL_PERCENT.get(xi["level"], 0),
+                                  source="XINPUT (4 LEVELS)", approx=True)
                     else:
                         st["source"] = "NOT REPORTED"
                 self.state = st
@@ -400,7 +506,7 @@ class App(tk.Tk):
             c.create_text(CX, CY - 8, text="--", fill=MUTED, font=(MONO, 34, "bold"), tags="dyn")
             c.create_text(CX, CY + 30, text="NO SIGNAL", fill=RED, font=(MONO, 10, "bold"), tags="dyn")
         elif known:
-            tilde = "~" if st["source"].startswith("XINPUT") else ""
+            tilde = "~" if st.get("approx") else ""
             c.create_text(CX, CY - 8, text=f"{tilde}{int(round(pct))}%", fill=TEXT,
                           font=(MONO, 34, "bold"), tags="dyn")
             c.create_text(CX, CY + 30, text="BATTERY", fill=MUTED, font=(MONO, 9), tags="dyn")
