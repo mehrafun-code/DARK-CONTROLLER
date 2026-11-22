@@ -15,9 +15,14 @@ pip install pyinstaller
 pyinstaller --onefile --windowed --icon assets/icon.ico --add-data "assets;assets" --name DarkController main.py
 ```
 
+## Diagnostic
+Press **D** in the app (or click the button) to save `diagnostic.txt` next to the exe.
+Run it once in each mode (wired, 2.4GHz dongle, Bluetooth) to find how your controller reports battery.
+
 ## Notes
-- XInput gives 4 levels (Empty / Low / Medium / Full), so the percentage is approximate.
-- "Charging" shows when the controller is connected by USB cable.
+- Battery is shown only when really reported (Windows Bluetooth battery or XInput wireless battery), else N/A.
+- "Charging" shows only when the controller is connected by USB cable.
+- Needs `hidapi` (`pip install hidapi`) when running from source.
 - Budget controllers may not report battery over Bluetooth / 2.4GHz dongle.
 
 ## Roadmap
